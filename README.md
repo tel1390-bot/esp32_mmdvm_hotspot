@@ -14,6 +14,7 @@ A FreeRTOS-based ESP32 firmware for a multi-mode digital voice modem hotspot. De
 > - Partition scheme: `ethelite_16MB` (16MB, 8MB APP + OTA + SPIFFS)
 > - Build with: `arduino-cli compile --fqbn "esp32:esp32:mmdvm:PartitionScheme=ethelite_16MB" .`
 > - Original project: [javastraat/esp32_mmdvm_hotspot](https://github.com/javastraat/esp32_mmdvm_hotspot)
+> - 📖 中文说明：[README_zh.md](README_zh.md)
 
 ## Current Firmware Version
 
