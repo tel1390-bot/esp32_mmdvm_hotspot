@@ -1,0 +1,447 @@
+/*
+ * web_handlers_nvs.cpp - NVS Preferences Viewer & Repair Routes
+ *
+ * Extracted from web_handlers_admin.cpp.
+ * All routes registered here use the global `server` object (extern WebServer server).
+ *
+ * Routes:
+ *   /api/show-prefs          - read all known NVS keys and return formatted HTML table
+ *   /api/show-prefs-raw      - enumerate all NVS keys via ESP-IDF iterator (any namespace)
+ *   /api/repair-prefs        - add missing NVS keys with config.h defaults, then reboot
+ *   /api/list-nvs-namespaces - list all NVS namespaces (JSON)
+ *   /api/prefs-reset         - erase the mmdvm NVS namespace
+ */
+
+#include "system/web_handlers_nvs.h"
+#include "system/system_webserver.h"   // extern WebServer server
+#include "system/system_logger.h"      // addLogMessage()
+#include "include/config.h"            // DEFAULT_* compile-time constants
+#include <Preferences.h>
+#include <vector>
+#include <algorithm>
+
+extern "C"
+{
+#include <nvs_flash.h>
+#include <nvs.h>
+}
+
+// ---------------------------------------------------------------------------
+// buildNvsHtml() — shared helper used by both show-prefs and show-prefs-raw.
+// Enumerates all keys in the given NVS namespace and returns an HTML table.
+// Sensitive keys are masked with a lock/reveal button.
+// ---------------------------------------------------------------------------
+static String buildNvsHtml(const String& ns)
+{
+  // Keys whose values are masked in the UI (lock/reveal button)
+  static const char* SENSITIVE[] = {
+    "wifi_pass","wifi_pass1","wifi_pass2","wifi_pass3","wifi_pass4","wifi_pass5",
+    "wifi_ap_pass","dmr_pass","dapnet_key","mqtt_pass","web_pass","ota_pass","wg_pub_key",
+    "tg_token","mqtt_cmd_tok","hp_pass"
+  };
+
+  int keyCount = 0;
+  String html =
+    "<style>"
+      ".secret-dots{color:#888;letter-spacing:3px;font-family:monospace;}"
+      ".lock-btn{background:none;border:none;cursor:pointer;font-size:1.1em;"
+        "padding:0 4px;vertical-align:middle;}"
+    "</style>"
+    "<h2>NVS Preferences (" + ns + " namespace) &mdash; {{KEY_COUNT}} keys</h2>"
+    "<table><tr><th>#</th><th>Key</th><th>Type</th><th>Value</th></tr>";
+
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(ns.c_str(), NVS_READONLY, &handle);
+  if (err != ESP_OK) {
+    html += "<tr><td colspan='4'>Error opening NVS namespace (code: " + String(err) + ")</td></tr>";
+    html += "</table>";
+    html.replace("{{KEY_COUNT}}", "0");
+    return html;
+  }
+
+  // Collect all entries first, then sort by key name
+  struct NvsEntry { String key; String typeName; String value; };
+  std::vector<NvsEntry> entries;
+
+  nvs_iterator_t it = NULL;
+  err = nvs_entry_find("nvs", ns.c_str(), NVS_TYPE_ANY, &it);
+  while (err == ESP_OK) {
+    nvs_entry_info_t info;
+    nvs_entry_info(it, &info);
+
+    String typeName;
+    String value;
+    switch (info.type) {
+      case NVS_TYPE_U8:  { uint8_t  v = 0; nvs_get_u8 (handle, info.key, &v); typeName = "u8";  value = String(v); break; }
+      case NVS_TYPE_I8:  { int8_t   v = 0; nvs_get_i8 (handle, info.key, &v); typeName = "i8";  value = String(v); break; }
+      case NVS_TYPE_U16: { uint16_t v = 0; nvs_get_u16(handle, info.key, &v); typeName = "u16"; value = String(v); break; }
+      case NVS_TYPE_I16: { int16_t  v = 0; nvs_get_i16(handle, info.key, &v); typeName = "i16"; value = String(v); break; }
+      case NVS_TYPE_U32: { uint32_t v = 0; nvs_get_u32(handle, info.key, &v); typeName = "u32"; value = String(v); break; }
+      case NVS_TYPE_I32: { int32_t  v = 0; nvs_get_i32(handle, info.key, &v); typeName = "i32"; value = String(v); break; }
+      case NVS_TYPE_U64: {
+        uint64_t v = 0; nvs_get_u64(handle, info.key, &v);
+        char buf[21]; snprintf(buf, sizeof(buf), "%llu", (unsigned long long)v);
+        typeName = "u64"; value = String(buf); break;
+      }
+      case NVS_TYPE_I64: {
+        int64_t v = 0; nvs_get_i64(handle, info.key, &v);
+        char buf[22]; snprintf(buf, sizeof(buf), "%lld", (long long)v);
+        typeName = "i64"; value = String(buf); break;
+      }
+      case NVS_TYPE_STR: {
+        size_t len = 0;
+        nvs_get_str(handle, info.key, NULL, &len);
+        if (len > 0) {
+          char* buf = (char*)malloc(len);
+          if (buf) { nvs_get_str(handle, info.key, buf, &len); value = String(buf); free(buf); }
+        }
+        typeName = "str"; break;
+      }
+      case NVS_TYPE_BLOB: { typeName = "blob"; value = "(binary data)"; break; }
+      default:            { typeName = "?";    value = "unknown";       break; }
+    }
+    entries.push_back({String(info.key), typeName, value});
+    err = nvs_entry_next(&it);
+  }
+  nvs_release_iterator(it);
+  nvs_close(handle);
+
+  std::sort(entries.begin(), entries.end(), [](const NvsEntry& a, const NvsEntry& b) {
+    return a.key.compareTo(b.key) < 0;
+  });
+
+  for (const auto& e : entries) {
+    keyCount++;
+    // Build value cell — wg_priv_key never shown, others masked via lock button
+    String cellContent;
+    if (e.key == "wg_priv_key") {
+      cellContent = e.value.isEmpty() ? "(not set)" : "&#x1F510; (never displayed)";
+    } else {
+      bool isSensitive = false;
+      for (const char* sk : SENSITIVE) { if (e.key == sk) { isSensitive = true; break; } }
+      if (isSensitive && !e.value.isEmpty()) {
+        String safe = e.value; safe.replace("&", "&amp;"); safe.replace("\"", "&quot;");
+        cellContent = "<span data-val=\"" + safe + "\" data-shown=\"0\" class=\"secret-dots\">"
+                      "&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;</span>"
+                      " <button"
+                      " onclick=\"var s=this.previousElementSibling;"
+                      "if(s.dataset.shown==='1'){s.textContent='\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022';"
+                      "s.dataset.shown='0';this.innerHTML='&#x1F512;';}else{s.textContent=s.dataset.val;"
+                      "s.dataset.shown='1';this.innerHTML='&#x1F513;';}\""
+                      " class=\"lock-btn\">&#x1F512;</button>";
+      } else {
+        cellContent = e.value;
+      }
+    }
+    html += "<tr><td>" + String(keyCount) + "</td><td>" + e.key +
+            "</td><td>" + e.typeName + "</td><td class='val'>" + cellContent + "</td></tr>";
+  }
+
+  html += "</table>";
+  html.replace("{{KEY_COUNT}}", String(keyCount));
+  return html;
+}
+
+void registerNvsRoutes()
+{
+  // Show Preferences — dynamic enumeration of all mmdvm NVS keys
+  server.on("/api/show-prefs", HTTP_GET, []() {
+    String html = buildNvsHtml("mmdvm");
+    addLogMessage("[Admin] Show preferences requested");
+    server.send(200, "text/html", html);
+  });
+
+  // Show Preferences RAW — same logic, namespace selectable via ?namespace=
+  server.on("/api/show-prefs-raw", HTTP_GET, []() {
+    String ns = server.hasArg("namespace") ? server.arg("namespace") : String("mmdvm");
+    String html = buildNvsHtml(ns);
+    addLogMessage("[Admin] Show preferences RAW requested for namespace: " + ns);
+    server.send(200, "text/html", html);
+  });
+
+
+  // Repair Preferences - checks all keys and adds missing ones with config.h defaults
+  server.on("/api/repair-prefs", HTTP_POST, []()
+            {
+    extern Preferences preferences;
+    preferences.begin("mmdvm", false);  // Read-write mode
+
+    int repaired = 0;
+    int total = 0;
+
+    // Helper: check if key exists, if not write default
+    // Bool keys
+    struct BoolPref {
+      const char* key;
+      bool defaultVal;
+    };
+    BoolPref boolPrefs[] = {
+      { "initialized", true },
+      { "mode_dmr", DEFAULT_MODE_DMR },
+      { "mode_dstar", DEFAULT_MODE_DSTAR },
+      { "mode_ysf", DEFAULT_MODE_YSF },
+      { "mode_p25", DEFAULT_MODE_P25 },
+      { "mode_nxdn", DEFAULT_MODE_NXDN },
+      { "mode_pocsag", DEFAULT_MODE_POCSAG },
+      { "dapnet_en",   DAPNET_ENABLED },
+      { "cwid_en",     CWID_ENABLED },
+      { "eth_enabled", ETH_ENABLED },
+      { "eth_debug", ETH_DEBUG },
+      { "wg_en", WG_ENABLED },
+      { "dns_fb_en", DNS_FALLBACK_ENABLED },
+      { "mdns_en", ENABLE_MDNS },
+      { "ntp_en", NTP_ENABLED },
+      { "mqtt_en", MQTT_ENABLED },
+      { "mqtt_hw_log", MQTT_HARDWARE_INFO_LOG },
+      { "oled_en", OLED_ENABLED },
+      { "sdcard_en", SDCARD_ENABLED },
+      { "ota_en", ARDUINO_OTA_ENABLED },
+      { "web_en", WEB_ENABLED },
+      { "tg_en", TELEGRAM_ENABLED },
+      { "tg_ric_en", TELEGRAM_RIC_FORWARD_ENABLED }
+    };
+    for (auto& p : boolPrefs) {
+      total++;
+      if (!preferences.isKey(p.key)) {
+        preferences.putBool(p.key, p.defaultVal);
+        repaired++;
+      }
+    }
+
+    // String keys
+    struct StrPref {
+      const char* key;
+      const char* defaultVal;
+    };
+    StrPref strPrefs[] = {
+      { "callsign", DMR_CALLSIGN },
+      { "wifi_s0_lbl", WIFI_SLOT_LABEL },
+      { "wifi_ssid", WIFI_SSID },
+      { "wifi_pass", WIFI_PASSWORD },
+      { "wifi_s1_lbl", WIFI_SLOT1_LABEL },
+      { "wifi_ssid1", WIFI_SSID1 },
+      { "wifi_pass1", WIFI_PASSWORD1 },
+      { "wifi_s2_lbl", WIFI_SLOT2_LABEL },
+      { "wifi_ssid2", WIFI_SSID2 },
+      { "wifi_pass2", WIFI_PASSWORD2 },
+      { "wifi_s3_lbl", WIFI_SLOT3_LABEL },
+      { "wifi_ssid3", WIFI_SSID3 },
+      { "wifi_pass3", WIFI_PASSWORD3 },
+      { "wifi_s4_lbl", WIFI_SLOT4_LABEL },
+      { "wifi_ssid4", WIFI_SSID4 },
+      { "wifi_pass4", WIFI_PASSWORD4 },
+      { "wifi_s5_lbl", WIFI_SLOT5_LABEL },
+      { "wifi_ssid5", WIFI_SSID5 },
+      { "wifi_pass5", WIFI_PASSWORD5 },
+      { "wifi_ap_ssid", WIFI_AP_SSID },
+      { "wifi_ap_pass", WIFI_AP_PASSWORD },
+      { "dns_fb_ip", DNS_FALLBACK_IP },
+      { "mdns_host", MDNS_HOSTNAME },
+      { "ntp_srv", NTP_SERVER },
+      { "mqtt_broker", MQTT_BROKER },
+      { "mqtt_user", MQTT_USER },
+      { "mqtt_pass", MQTT_PASSWORD },
+      { "mqtt_status", MQTT_STATUS_TOPIC },
+      { "mqtt_logs", MQTT_LOGS_TOPIC },
+      { "mqtt_hw", MQTT_HARDWARE_TOPIC },
+      { "mqtt_sub", MQTT_SUBSCRIBE_TOPIC },
+      { "mq_log_task", MQTT_LOGGER_TASK_TOPIC },
+      { "mqtt_oled_task", MQTT_OLED_TASK_TOPIC },
+      { "mqtt_led_task", MQTT_LED_TASK_TOPIC },
+      { "mqtt_wifi_task", MQTT_WIFI_TASK_TOPIC },
+      { "mqtt_eth_task", MQTT_ETH_TASK_TOPIC },
+      { "mq_ota_task", MQTT_ARDUINO_OTA_TASK_TOPIC },
+      { "mqtt_ntp_task", MQTT_NTP_TASK_TOPIC },
+      { "mq_mqttc_task", MQTT_MQTT_CLIENT_TASK_TOPIC },
+      { "mq_web_task", MQTT_WEB_SERVER_TASK_TOPIC },
+      { "mq_sd_task", MQTT_SD_CARD_TASK_TOPIC },
+      { "mq_sensor_task", MQTT_SENSOR_TASK_TOPIC },
+      { "mqtt_wg_task", MQTT_WG_TASK_TOPIC },
+      { "mqtt_modem_task", MQTT_MODEM_TASK_TOPIC },
+      { "mqtt_dmr_task", MQTT_DMR_TASK_TOPIC },
+      { "mqtt_dstar_task", MQTT_DSTAR_TASK_TOPIC },
+      { "mqtt_ysf_task", MQTT_YSF_TASK_TOPIC },
+      { "mqtt_p25_task", MQTT_P25_TASK_TOPIC },
+      { "mqtt_nxdn_task", MQTT_NXDN_TASK_TOPIC },
+      { "mq_pocsag_task", MQTT_POCSAG_TASK_TOPIC },
+      { "mq_dapnet_task", MQTT_DAPNET_TASK_TOPIC },
+      { "dapnet_server", DAPNET_SERVER },
+      { "dapnet_key",    DAPNET_AUTH_KEY },
+      { "dapnet_cs",     DAPNET_NODE_CS },
+      { "pocsag_wlist",  POCSAG_WHITELIST },
+      { "pocsag_blist",  POCSAG_BLACKLIST },
+      { "wg_local_ip", WG_LOCAL_IP },
+      { "wg_priv_key", WG_PRIVATE_KEY },
+      { "wg_pub_key", WG_PUBLIC_KEY },
+      { "wg_endpoint", WG_ENDPOINT },
+      { "wg_dns", WG_DNS },
+      { "wg_allowed_ips", WG_ALLOWED_IPS },
+      { "ota_pass", ARDUINO_OTA_PASSWORD },
+      { "web_user", WEB_USERNAME },
+      { "web_pass", WEB_PASSWORD },
+      { "dmr_server", DMR_SERVER },
+      { "dmr_pass", DMR_PASSWORD },
+      { "hs_callsign", HOTSPOT_CALLSIGN },
+      { "hs_suffix", HOTSPOT_SUFFIX },
+      { "hs_latitude", HOTSPOT_LATITUDE },
+      { "hs_longitude", HOTSPOT_LONGITUDE },
+      { "hs_location", HOTSPOT_LOCATION },
+      { "hs_desc", HOTSPOT_DESCRIPTION },
+      { "hs_url", HOTSPOT_URL },
+      { "dmr_api_url", DMR_API_URL },
+      { "qrz_lookup_url", QRZ_LOOKUP_URL },
+      { "hp_user", HAMPAGER_USER },
+      { "hp_pass", HAMPAGER_PASSWORD },
+      { "hp_txg", HAMPAGER_TXG },
+      { "tg_token", TELEGRAM_BOT_TOKEN },
+      { "tg_chat_id", TELEGRAM_CHAT_ID },
+      { "tg_ric_list", TELEGRAM_RIC_LIST },
+      { "mqtt_cmd_tok", MQTT_CMD_TOKEN }
+    };
+    for (auto& p : strPrefs) {
+      total++;
+      if (!preferences.isKey(p.key)) {
+        preferences.putString(p.key, p.defaultVal);
+        repaired++;
+      }
+    }
+
+    // UInt keys
+    struct UIntPref {
+      const char* key;
+      uint32_t defaultVal;
+    };
+    UIntPref uintPrefs[] = {
+      { "dmr_id", DMR_ID },
+      { "dmr_rx_freq", DMR_RX_FREQ },
+      { "dmr_tx_freq", DMR_TX_FREQ },
+      { "ntp_sync", NTP_SYNC_INTERVAL_MS },
+      { "pocsag_freq", POCSAG_FREQUENCY },
+      { "dapnet_ric", 0 }
+    };
+    for (auto& p : uintPrefs) {
+      total++;
+      if (!preferences.isKey(p.key)) {
+        preferences.putUInt(p.key, p.defaultVal);
+        repaired++;
+      }
+    }
+
+    // UChar keys
+    struct UCharPref {
+      const char* key;
+      uint8_t defaultVal;
+    };
+    UCharPref ucharPrefs[] = {
+      { "cwid_int",     CWID_INTERVAL_MIN },
+      { "dmr_ssid", DMR_SSID },
+      { "dmr_color_code", DMR_COLOR_CODE },
+      { "dmr_rf_power", DMR_RF_POWER },
+      { "wifi_ap_ch", WIFI_AP_CHANNEL },
+      { "wifi_max_ret", WIFI_MAX_RETRIES }
+    };
+    for (auto& p : ucharPrefs) {
+      total++;
+      if (!preferences.isKey(p.key)) {
+        preferences.putUChar(p.key, p.defaultVal);
+        repaired++;
+      }
+    }
+
+    // UShort keys
+    struct UShortPref {
+      const char* key;
+      uint16_t defaultVal;
+    };
+    UShortPref ushortPrefs[] = {
+      { "mqtt_port", MQTT_PORT }, { "mqtt_hw_int", MQTT_SEND_HARDWARE_INFO }, { "web_port", WEB_SERVER_PORT },
+      { "dmr_port", DMR_PORT }, { "dmr_lport", DMR_LOCAL_PORT }, { "dapnet_port", DAPNET_PORT },
+      { "dmr_hist_size", DMR_HISTORY_SIZE }, { "dmr_act_tout", DMR_ACTIVITY_TIMEOUT },
+      { "dmr_usr_cache", DMR_USER_CACHE_SIZE }, { "dmr_cs_cache", DMR_CALLSIGN_CACHE_SIZE },
+      { "dmr_api_tout", DMR_API_TIMEOUT },
+      { "wg_ep_port", WG_ENDPOINT_PORT },
+      { "tg_ric_cool", TELEGRAM_RIC_COOLDOWN }
+    };
+    for (auto& p : ushortPrefs) {
+      total++;
+      if (!preferences.isKey(p.key)) {
+        preferences.putUShort(p.key, p.defaultVal);
+        repaired++;
+      }
+    }
+
+    // Int keys
+    struct IntPref {
+      const char* key;
+      int32_t defaultVal;
+    };
+    IntPref intPrefs[] = {
+      { "ntp_gmt", NTP_GMT_OFFSET_SEC }, { "ntp_dst", NTP_DAYLIGHT_OFFSET_SEC }, { "led_pin", LED_PIN }, { "button_pin", BUTTON_PIN }, { "i2c_sda", I2C_SDA_PIN }, { "i2c_scl", I2C_SCL_PIN }, { "oled_addr", OLED_I2C_ADDRESS }, { "oled_w", OLED_WIDTH }, { "oled_h", OLED_HEIGHT }, { "spi_miso", SPI_MISO_PIN }, { "spi_mosi", SPI_MOSI_PIN }, { "spi_sclk", SPI_SCLK_PIN }, { "sd_cs", SD_CS_PIN }, { "eth_miso", ETH_MISO_PIN }, { "eth_mosi", ETH_MOSI_PIN }, { "eth_sclk", ETH_SCLK_PIN }, { "eth_cs", ETH_CS_PIN }, { "eth_int", ETH_INT_PIN }, { "eth_rst", ETH_RST_PIN }, { "eth_addr", ETH_ADDR }, { "eth_cto", ETH_CONNECT_TIMEOUT }, { "mmdvm_rx", MMDVM_RX_PIN }, { "mmdvm_tx", MMDVM_TX_PIN }, { "mmdvm_boot", MMDVM_BOOT_PIN }, { "mmdvm_rst", MMDVM_RESET_PIN }, { "mmdvm_wakeup", MMDVM_WAKEUP_PIN }, { "mmdvm_baud", MMDVM_SERIAL_BAUD }, { "mmdvm_txdly", MMDVM_TX_DELAY }, { "mmdvm_rxlvl", MMDVM_RX_LEVEL }, { "mmdvm_txlvl", MMDVM_TX_LEVEL }, { "ota_port", ARDUINO_OTA_PORT },
+      { "hs_height", HOTSPOT_HEIGHT }
+    };
+    for (auto& p : intPrefs) {
+      total++;
+      if (!preferences.isKey(p.key)) {
+        preferences.putInt(p.key, p.defaultVal);
+        repaired++;
+      }
+    }
+
+
+    preferences.end();
+
+    String msg;
+    if (repaired > 0) {
+      msg = "Repaired: " + String(repaired) + " missing keys added (out of " + String(total) + " checked).\nSystem will reboot in 3 seconds.";
+      addLogMessage("[Admin] Preferences repaired: " + String(repaired) + " keys added");
+      server.send(200, "text/plain", msg);
+      delay(3000);
+      ESP.restart();
+    } else {
+      msg = "All " + String(total) + " preference keys present. No repair needed.";
+      addLogMessage("[Admin] Preferences check: all " + String(total) + " keys OK");
+      server.send(200, "text/plain", msg);
+    } });
+
+  // List all NVS namespaces (JSON)
+  server.on("/api/list-nvs-namespaces", HTTP_GET, []() {
+    std::vector<String> namespaces;
+    nvs_iterator_t it = NULL;
+    esp_err_t err = nvs_entry_find("nvs", NULL, NVS_TYPE_ANY, &it);
+    while (err == ESP_OK) {
+      nvs_entry_info_t info;
+      nvs_entry_info(it, &info);
+      String ns = String(info.namespace_name);
+      bool found = false;
+      for (auto &n : namespaces) { if (n == ns) { found = true; break; } }
+      if (!found) namespaces.push_back(ns);
+      err = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+    String json = "{\"namespaces\": [";
+    for (size_t i = 0; i < namespaces.size(); ++i) {
+      json += '"' + namespaces[i] + '"';
+      if (i < namespaces.size() - 1) json += ",";
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+  });
+
+  // Erase all keys in the 'mmdvm' NVS namespace
+  server.on("/api/prefs-reset", HTTP_POST, []()
+            {
+    nvs_handle_t nvsHandle;
+    esp_err_t err = nvs_open("mmdvm", NVS_READWRITE, &nvsHandle);
+    if (err == ESP_OK) {
+      err = nvs_erase_all(nvsHandle);
+      nvs_commit(nvsHandle);
+      nvs_close(nvsHandle);
+      if (err == ESP_OK) {
+        addLogMessage("[Settings] All preferences erased from NVS (namespace: mmdvm)");
+        server.send(200, "text/plain", "SUCCESS: All preferences erased from NVS (namespace: mmdvm)");
+        return;
+      }
+    }
+    addLogMessage("[Settings] Failed to erase NVS: " + String(err));
+    server.send(500, "text/plain", "ERROR: Failed to erase NVS (code: " + String(err) + ")"); });
+}
